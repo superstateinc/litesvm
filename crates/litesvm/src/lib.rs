@@ -792,7 +792,6 @@ impl LiteSVM {
         u64,
         Option<Pubkey>,
     ) {
-        eprintln!("[DEBUG] === process_transaction called ===");
         let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
             compute_unit_limit: u64::from(compute_budget_limits.compute_unit_limit),
             heap_size: compute_budget_limits.updated_heap_bytes,
@@ -804,37 +803,28 @@ impl LiteSVM {
         let mut accumulated_consume_units = 0;
         let message = tx.message();
         let account_keys = message.account_keys();
-        eprintln!("[DEBUG] Transaction has {} instructions", message.instructions().len());
 
         // Auto-load any programs referenced in this transaction that aren't in the cache
         // This handles the case where upgradeable programs were deployed but their program accounts
         // weren't synced into the cache (because only programdata was in ExecutionRecord)
-        eprintln!("[DEBUG] Auto-loading: checking {} instructions", message.instructions().len());
-        for (idx, instruction) in message.instructions().iter().enumerate() {
+        for instruction in message.instructions().iter() {
             let program_id = &account_keys[instruction.program_id_index as usize];
-            eprintln!("[DEBUG] Instruction {}: program_id={} (index={})", idx, program_id, instruction.program_id_index);
+
             if program_cache_for_tx_batch.find(program_id).is_none() {
-                eprintln!("[DEBUG]   Program NOT in cache");
                 // Program not in cache - check if it exists in account database
                 if let Some(program_account) = self.accounts.get_account(program_id) {
-                    eprintln!("[DEBUG]   Found in accounts DB, executable={}, owner={}",
-                             program_account.executable(), program_account.owner());
                     if program_account.executable() {
                         match self.accounts.load_program(&program_account) {
                             Ok(loaded_program) => {
-                                eprintln!("[DEBUG]   Successfully loaded program");
-                                program_cache_for_tx_batch.replenish(*program_id, Arc::new(loaded_program));
+                                program_cache_for_tx_batch
+                                    .replenish(*program_id, Arc::new(loaded_program));
                             }
                             Err(e) => {
-                                eprintln!("[DEBUG]   Failed to load program: {:?}", e);
+                                log::warn!("Failed to auto-load program {}: {:?}", program_id, e);
                             }
                         }
                     }
-                } else {
-                    eprintln!("[DEBUG]   NOT found in accounts DB");
                 }
-            } else {
-                eprintln!("[DEBUG]   Program already in cache");
             }
         }
 
@@ -853,45 +843,31 @@ impl LiteSVM {
         );
         let mut validated_fee_payer = false;
         let mut payer_key = None;
-        eprintln!("[ACCOUNT_LOAD] Loading {} account_keys", account_keys.len());
         let maybe_accounts = account_keys
             .iter()
             .enumerate()
             .map(|(i, key)| {
                 let mut account_found = true;
                 let account = if solana_sdk_ids::sysvar::instructions::check_id(key) {
-                    eprintln!("[ACCOUNT_LOAD] Index {}: {} - Instructions sysvar", i, key);
                     construct_instructions_account(message)
                 } else {
                     let instruction_account = u8::try_from(i)
                         .map(|i| instruction_accounts.contains(&&i))
                         .unwrap_or(false);
-                    let in_cache = self.accounts.programs_cache.find(key).is_some();
-                    eprintln!("[ACCOUNT_LOAD] Index {}: {} - instruction_account={}, writable={}, in_cache={}",
-                             i, key, instruction_account, message.is_writable(i), in_cache);
                     let mut account = if !instruction_account
                         && !message.is_writable(i)
-                        && in_cache
+                        && self.accounts.programs_cache.find(key).is_some()
                     {
                         // Optimization to skip loading of accounts which are only used as
                         // programs in top-level instructions and not passed as instruction accounts.
-                        let acc = self.accounts.get_account(key).unwrap();
-                        eprintln!("[ACCOUNT_LOAD]   -> Loaded from cache path: executable={}, owner={}",
-                                 acc.executable(), acc.owner());
-                        acc
+                        self.accounts.get_account(key).unwrap()
                     } else {
-                        let acc = self.accounts.get_account(key).unwrap_or_else(|| {
+                        self.accounts.get_account(key).unwrap_or_else(|| {
                             account_found = false;
-                            eprintln!("[ACCOUNT_LOAD]   -> Account NOT FOUND, using default");
                             let mut default_account = AccountSharedData::default();
                             default_account.set_rent_epoch(0);
                             default_account
-                        });
-                        if account_found {
-                            eprintln!("[ACCOUNT_LOAD]   -> Loaded from DB: executable={}, owner={}",
-                                     acc.executable(), acc.owner());
-                        }
-                        acc
+                        })
                     };
                     if !validated_fee_payer
                         && (!message.is_invoked(i) || message.is_instruction_account(i))
@@ -938,14 +914,11 @@ impl LiteSVM {
                 let program_index = c.program_id_index as usize;
                 // This may never error, because the transaction is sanitized
                 let (program_id, program_account) = accounts.get(program_index).unwrap();
-                eprintln!("[CRITICAL] Checking program {} at index {}: executable={}, owner={}",
-                         program_id, program_index, program_account.executable(), program_account.owner());
                 if native_loader::check_id(program_id) {
                     return Ok(account_indices);
                 }
                 if !program_account.executable() {
                     error!("Program account {program_id} is not executable.");
-                    eprintln!("[CRITICAL] FAILING: Program {} is not executable!", program_id);
                     return Err(TransactionError::InvalidProgramForExecution);
                 }
                 account_indices.insert(0, program_index as IndexOfAccount);
@@ -1438,7 +1411,6 @@ fn execute_tx_helper(
     let msg = sanitized_tx.message();
 
     let num_message_accounts = msg.account_keys().len();
-    eprintln!("[EXECUTE_TX_HELPER] Processing {} accounts", accounts.len());
     let post_accounts: Vec<(Pubkey, AccountSharedData)> = accounts
         .into_iter()
         .enumerate()
@@ -1455,13 +1427,8 @@ fn execute_tx_helper(
 
             // Also sync BPF loader accounts even if not writable
             // This ensures BPF Loader V2/V3 program accounts are synced after deployment
-            // Note: The executable flag isn't set in TransactionContext during deployment,
-            // so we check owner instead
-            let is_bpf_loader_account = pair.1.owner() == &bpf_loader_upgradeable::id() ||
-                                       pair.1.owner() == &bpf_loader::id();
-
-            eprintln!("[EXECUTE_TX_HELPER] Account {}: {} - executable={}, owner={}, is_writable={}, is_bpf_loader_account={}",
-                     idx, pair.0, pair.1.executable(), pair.1.owner(), is_writable, is_bpf_loader_account);
+            let is_bpf_loader_account = pair.1.owner() == &bpf_loader_upgradeable::id()
+                || pair.1.owner() == &bpf_loader::id();
 
             if is_writable || is_bpf_loader_account {
                 Some(pair)
@@ -1470,7 +1437,6 @@ fn execute_tx_helper(
             }
         })
         .collect();
-    eprintln!("[EXECUTE_TX_HELPER] Syncing {} accounts", post_accounts.len());
 
     (signature, return_data, inner_instructions, post_accounts)
 }
