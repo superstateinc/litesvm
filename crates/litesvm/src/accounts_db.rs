@@ -6,7 +6,6 @@ use {
     solana_clock::Clock,
     solana_instruction::error::InstructionError,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
-    solana_loader_v4_interface::state::LoaderV4State,
     solana_message::{
         v0::{LoadedAddresses, MessageAddressTableLookup},
         AddressLoader, AddressLoaderError,
@@ -18,7 +17,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_sdk_ids::{
-        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, native_loader,
         sysvar::{
             clock::ID as CLOCK_ID, epoch_rewards::ID as EPOCH_REWARDS_ID,
             epoch_schedule::ID as EPOCH_SCHEDULE_ID, last_restart_slot::ID as LAST_RESTART_SLOT_ID,
@@ -84,11 +83,12 @@ impl AccountsDb {
             && pubkey != Pubkey::default()
             && account.owner() != &native_loader::ID
         {
-            let loaded_program = self.load_program(&account)?;
+            let loaded_program = self.load_program(&account).map_err(LiteSVMError::Instruction)?;
             self.programs_cache
                 .replenish(pubkey, Arc::new(loaded_program));
         } else {
-            self.maybe_handle_sysvar_account(pubkey, &account)?;
+            self.maybe_handle_sysvar_account(pubkey, &account)
+                .map_err(LiteSVMError::InvalidSysvarData)?;
         }
         self.add_account_no_checks(pubkey, account);
         Ok(())
@@ -103,6 +103,7 @@ impl AccountsDb {
             EpochRewards, EpochSchedule, Fees, LastRestartSlot, RecentBlockhashes, Rent,
             SlotHashes, StakeHistory,
         };
+
         let cache = &mut self.sysvar_cache;
         #[allow(deprecated)]
         match pubkey {
@@ -205,18 +206,77 @@ impl AccountsDb {
         &mut self,
         mut accounts: Vec<(Pubkey, AccountSharedData)>,
     ) -> Result<(), LiteSVMError> {
+        eprintln!("[SYNC_ACCOUNTS] Syncing {} accounts", accounts.len());
         // need to add programdata accounts first if there are any
         itertools::partition(&mut accounts, |x| {
             x.1.owner() == &bpf_loader_upgradeable::id()
                 && x.1.data().first().is_some_and(|byte| *byte == 3)
         });
-        for (pubkey, acc) in accounts {
+
+        for (pubkey, mut acc) in accounts {
+            eprintln!("[SYNC_ACCOUNTS] Adding account {}: executable={}, owner={}",
+                     pubkey, acc.executable(), acc.owner());
+
+            // For BPF Loader Upgradeable V3 program accounts, the executable flag may not be set
+            // during deployment. We need to check if this is a Program account and manually set executable=true
+            if acc.owner() == &bpf_loader_upgradeable::id() && !acc.executable() {
+                eprintln!("[SYNC_ACCOUNTS] Found BPF upgradeable account {}, checking state...", pubkey);
+                match acc.state() {
+                    Ok(UpgradeableLoaderState::Program { .. }) => {
+                        eprintln!("[SYNC_ACCOUNTS] ✓ Detected V3 PROGRAM account {}, setting executable=true", pubkey);
+                        acc.set_executable(true);
+                    }
+                    Ok(UpgradeableLoaderState::ProgramData { .. }) => {
+                        eprintln!("[SYNC_ACCOUNTS]   Account {} is ProgramData (not Program), skipping", pubkey);
+                    }
+                    Ok(state) => {
+                        eprintln!("[SYNC_ACCOUNTS]   Account {} has other state: {:?}", pubkey, state);
+                    }
+                    Err(e) => {
+                        eprintln!("[SYNC_ACCOUNTS]   Failed to deserialize state for {}: {:?}", pubkey, e);
+                    }
+                }
+            }
+
             self.add_account(pubkey, acc)?;
         }
+
+        eprintln!("[SYNC_ACCOUNTS] Checking for programs to auto-load...");
+        // After syncing accounts, check for any executable program accounts that weren't explicitly synced
+        // This handles the case where deployment creates program+programdata, but only programdata is in ExecutionRecord
+        // Also handles BPF Loader V2 programs (Orca/Raydium) loaded via add_program_from_file
+        let accounts_snapshot: Vec<(Pubkey, AccountSharedData)> = self.inner.iter()
+            .filter(|(pubkey, acc)| {
+                let is_executable = acc.executable();
+                let is_loadable_program = acc.owner() == &bpf_loader_upgradeable::id()
+                    || acc.owner() == &bpf_loader::id();
+                let in_cache = self.programs_cache.find(pubkey).is_some();
+                let should_load = is_executable && is_loadable_program && !in_cache;
+                if should_load {
+                    eprintln!("[SYNC_ACCOUNTS]   Found program to auto-load: {}", pubkey);
+                }
+                should_load
+            })
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        eprintln!("[SYNC_ACCOUNTS] Auto-loading {} programs", accounts_snapshot.len());
+        for (program_pubkey, program_acc) in accounts_snapshot {
+            match self.load_program(&program_acc) {
+                Ok(loaded_program) => {
+                    eprintln!("[SYNC_ACCOUNTS] Successfully auto-loaded program {}", program_pubkey);
+                    self.programs_cache.replenish(program_pubkey, Arc::new(loaded_program));
+                }
+                Err(e) => {
+                    eprintln!("[SYNC_ACCOUNTS] Failed to auto-load program {}: {:?}", program_pubkey, e);
+                }
+            }
+        }
+
         Ok(())
     }
 
-    fn load_program(
+    pub(crate) fn load_program(
         &self,
         program_account: &AccountSharedData,
     ) -> Result<ProgramCacheEntry, InstructionError> {
@@ -276,32 +336,49 @@ impl AccountsDb {
                 error!("Index out of bounds using bpf_loader_upgradeable.");
                 Err(InstructionError::InvalidAccountData)
             }
-        } else if loader_v4::check_id(owner) {
-            if let Some(elf_bytes) = program_account
-                .data()
-                .get(LoaderV4State::program_data_offset()..)
-            {
-                ProgramCacheEntry::new(
-                    &loader_v4::id(),
-                    program_runtime_v1,
-                    slot,
-                    slot,
-                    elf_bytes,
-                    program_account.data().len(),
-                    metrics,
-                )
-                .map_err(|_| {
-                    error!("Error encountered when calling LoadedProgram::new() for loader_v4.");
-                    InstructionError::InvalidAccountData
-                })
-            } else {
-                error!("Index out of bounds using loader_v4.");
-                Err(InstructionError::InvalidAccountData)
-            }
         } else {
             error!("Owner does not match any expected loader.");
             Err(InstructionError::IncorrectProgramId)
         }
+    }
+
+    /// Load all existing executable programs into the program cache.
+    /// This should be called during initialization to ensure programs that exist in the
+    /// account database (e.g., from previous test runs) are available for execution.
+    pub(crate) fn load_all_existing_programs(&mut self) -> Result<(), LiteSVMError> {
+        eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] Scanning for executable programs...");
+
+        let accounts_snapshot: Vec<(Pubkey, AccountSharedData)> = self.inner.iter()
+            .filter(|(pubkey, acc)| {
+                let is_executable = acc.executable();
+                let is_loadable_program = acc.owner() == &bpf_loader_upgradeable::id()
+                    || acc.owner() == &bpf_loader::id();
+                let in_cache = self.programs_cache.find(pubkey).is_some();
+                let should_load = is_executable && is_loadable_program && !in_cache;
+                if should_load {
+                    eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] Found program to load: {} (owner: {})", pubkey, acc.owner());
+                }
+                should_load
+            })
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] Loading {} programs into cache", accounts_snapshot.len());
+
+        for (program_pubkey, program_acc) in accounts_snapshot {
+            match self.load_program(&program_acc) {
+                Ok(loaded_program) => {
+                    eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] ✓ Successfully loaded program {}", program_pubkey);
+                    self.programs_cache.replenish(program_pubkey, Arc::new(loaded_program));
+                }
+                Err(e) => {
+                    eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] ✗ Failed to load program {}: {:?}", program_pubkey, e);
+                }
+            }
+        }
+
+        eprintln!("[LOAD_ALL_EXISTING_PROGRAMS] Completed loading programs");
+        Ok(())
     }
 
     fn load_lookup_table_addresses(
