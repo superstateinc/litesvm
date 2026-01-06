@@ -309,6 +309,7 @@ use {
     agave_feature_set::{
         increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
     },
+    itertools::Itertools,
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_syscalls::{
         create_program_runtime_environment_v1, create_program_runtime_environment_v2,
