@@ -8,7 +8,7 @@ version = "0.7.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/LiteSVM/litesvm"
-rust-version = "1.86.0"
+rust-version = "1.89.0"
 
 [workspace.dependencies]
 agave-feature-set = "2.3"
@@ -82,7 +82,7 @@ solana-sysvar-id = "2.2"
 solana-timings = "2.3"
 solana-transaction = "2.2"
 solana-transaction-context = "2.3"
-solana-transaction-error = "2.2"
+solana-transaction-error = { version = "2.2", features = ["serde"] }
 solana-vote-program = "2.3"
 spl-associated-token-account-client = "2.0"
 spl-token = "8.0"

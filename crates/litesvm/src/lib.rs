@@ -838,12 +838,6 @@ impl LiteSVM {
         let mut accumulated_consume_units = 0;
         let message = tx.message();
         let account_keys = message.account_keys();
-        let instruction_accounts = message
-            .instructions()
-            .iter()
-            .flat_map(|instruction| &instruction.accounts)
-            .unique()
-            .collect::<Vec<&u8>>();
 
         // Auto-load any programs referenced in this transaction that aren't in the cache
         // This handles the case where upgradeable programs were deployed but their program accounts
@@ -875,7 +869,7 @@ impl LiteSVM {
             .flat_map(|instruction| &instruction.accounts)
             .unique()
             .collect::<Vec<&u8>>();
-        let prioritization_fee = compute_budget_limits.get_prioritization_fee();
+        let _prioritization_fee = compute_budget_limits.get_prioritization_fee();
         let fee = solana_fee::calculate_fee(
             message,
             false,
@@ -1344,7 +1338,7 @@ impl LiteSVM {
 
     #[cfg(feature = "internal-test")]
     pub fn get_feature_set(&self) -> Arc<FeatureSet> {
-        self.feature_set.clone()
+        Arc::new(self.feature_set.clone())
     }
 
     fn check_transaction_age(&self, tx: &SanitizedTransaction) -> Result<(), ExecutionResult> {
