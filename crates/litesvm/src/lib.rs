@@ -306,6 +306,7 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state, RentState},
         },
     },
+    itertools::Itertools,
     agave_feature_set::{
         increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
     },
@@ -992,7 +993,7 @@ impl LiteSVM {
             }
         }
 
-        let instruction_accounts = message
+        let _instruction_accounts = message
             .instructions()
             .iter()
             .flat_map(|instruction| &instruction.accounts)
@@ -1604,7 +1605,7 @@ fn execute_tx_helper(
     let msg = sanitized_tx.message();
 
     let num_message_accounts = msg.account_keys().len();
-    let post_accounts: Vec<(Pubkey, AccountSharedData)> = accounts
+    let post_accounts: Vec<(Address, AccountSharedData)> = accounts
         .into_iter()
         .enumerate()
         .filter_map(|(idx, pair)| {
