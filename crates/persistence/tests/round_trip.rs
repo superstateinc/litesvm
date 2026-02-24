@@ -1,14 +1,15 @@
 use {
     litesvm::LiteSVM,
-    litesvm_persistence::{load_from_file, save_to_file, from_bytes, to_bytes},
+    litesvm_persistence::{from_bytes, load_from_file, save_to_file, to_bytes},
     solana_account::Account,
     solana_address::Address,
     solana_clock::Clock,
+    solana_instruction::{account_meta::AccountMeta, Instruction},
     solana_keypair::Keypair,
-    solana_message::Message,
+    solana_message::{Message, VersionedMessage},
     solana_signer::Signer,
     solana_system_interface::instruction::transfer,
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
 };
 
 fn temp_path(name: &str) -> std::path::PathBuf {
@@ -238,6 +239,59 @@ fn send_transaction_after_restore() {
 
     let to_account = restored.get_account(&to).unwrap();
     assert_eq!(to_account.lamports, 1000);
+}
+
+#[test]
+fn bpf_program_round_trip() {
+    let program_id = Address::new_unique();
+    let mut svm = LiteSVM::new();
+    let program_bytes =
+        include_bytes!("../../node-litesvm/program_bytes/spl_example_logging.so");
+    svm.add_program(program_id, program_bytes).unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+
+    // Execute the program before save to confirm it works
+    let ix = Instruction {
+        program_id,
+        accounts: vec![AccountMeta {
+            pubkey: Address::new_unique(),
+            is_signer: false,
+            is_writable: true,
+        }],
+        data: vec![5, 10, 11, 12, 13, 14],
+    };
+    let blockhash = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix.clone()], Some(&payer.pubkey()), &blockhash);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
+    let meta = svm.send_transaction(tx).unwrap();
+    assert_eq!(meta.logs[1], "Program log: static string");
+
+    // Save and restore
+    let path = temp_path("bpf_program.bin");
+    save_to_file(&svm, &path).unwrap();
+    let mut restored = load_from_file(&path).unwrap();
+
+    // Execute the same program on the restored instance
+    let payer2 = Keypair::new();
+    restored.airdrop(&payer2.pubkey(), 1_000_000_000).unwrap();
+    let blockhash2 = restored.latest_blockhash();
+    let ix2 = Instruction {
+        program_id,
+        accounts: vec![AccountMeta {
+            pubkey: Address::new_unique(),
+            is_signer: false,
+            is_writable: true,
+        }],
+        data: vec![5, 10, 11, 12, 13, 14],
+    };
+    let msg2 = Message::new_with_blockhash(&[ix2], Some(&payer2.pubkey()), &blockhash2);
+    let tx2 = VersionedTransaction::try_new(VersionedMessage::Legacy(msg2), &[&payer2]).unwrap();
+    let meta2 = restored.send_transaction(tx2).unwrap();
+
+    // The restored program should produce identical logs
+    assert_eq!(meta2.logs[1], "Program log: static string");
 }
 
 #[test]

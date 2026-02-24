@@ -22,9 +22,11 @@ agave-feature-set.workspace = true
 solana-compute-budget.workspace = true
 
 [dev-dependencies]
+solana-address = { workspace = true, features = ["serde"] }
 solana-keypair.workspace = true
 solana-signer.workspace = true
 solana-clock.workspace = true
+solana-instruction.workspace = true
 solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-message.workspace = true
 solana-transaction.workspace = true
