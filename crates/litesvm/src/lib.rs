@@ -1679,6 +1679,59 @@ where
     }
 }
 
+#[cfg(feature = "persistence-internal")]
+impl LiteSVM {
+    /// Returns the raw airdrop keypair bytes.
+    pub fn airdrop_keypair_bytes(&self) -> &[u8; 64] {
+        &self.airdrop_kp
+    }
+
+    /// Returns whether blockhash checking is enabled.
+    pub fn get_blockhash_check(&self) -> bool {
+        self.blockhash_check
+    }
+
+    /// Returns the fee structure.
+    pub fn get_fee_structure(&self) -> &FeeStructure {
+        &self.fee_structure
+    }
+
+    /// Returns the log bytes limit.
+    pub fn get_log_bytes_limit(&self) -> Option<usize> {
+        self.log_bytes_limit
+    }
+
+    /// Returns the feature set.
+    pub fn get_feature_set_ref(&self) -> &FeatureSet {
+        &self.feature_set
+    }
+
+    /// Returns an iterator over the transaction history entries.
+    pub fn transaction_history_entries(
+        &self,
+    ) -> &indexmap::IndexMap<Signature, TransactionResult> {
+        self.history.inner()
+    }
+
+    /// Sets the latest blockhash directly (used for state restoration).
+    pub fn set_latest_blockhash(&mut self, hash: Hash) {
+        self.latest_blockhash = hash;
+    }
+
+    /// Sets the airdrop keypair bytes directly (used for state restoration).
+    pub fn set_airdrop_keypair(&mut self, kp: [u8; 64]) {
+        self.airdrop_kp = kp;
+    }
+
+    /// Restores the transaction history from persisted entries.
+    pub fn restore_transaction_history(
+        &mut self,
+        entries: impl IntoIterator<Item = (Signature, TransactionResult)>,
+    ) {
+        self.history.restore_from_entries(entries);
+    }
+}
+
 #[cfg(feature = "invocation-inspect-callback")]
 pub trait InvocationInspectCallback: Send + Sync {
     fn before_invocation(
