@@ -5,66 +5,155 @@
 // explicitly loaded via add_program().
 
 use {
-    litesvm::LiteSVM, solana_account::AccountSharedData, solana_instruction::Instruction,
-    solana_keypair::Keypair, solana_loader_v3_interface::state::UpgradeableLoaderState,
-    solana_pubkey::Pubkey, solana_sdk_ids::bpf_loader_upgradeable, solana_signer::Signer,
-    solana_transaction::Transaction, std::path::PathBuf,
+    agave_feature_set::FeatureSet,
+    litesvm::LiteSVM,
+    solana_address::Address,
+    solana_instruction::Instruction,
+    solana_keypair::Keypair,
+    solana_loader_v3_interface::{
+        instruction as loader_v3_instruction, state::UpgradeableLoaderState,
+    },
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_sdk_ids::bpf_loader_upgradeable,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
+    std::path::PathBuf,
 };
 
 fn read_counter_program() -> Vec<u8> {
     let mut so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     so_path.push("test_programs/target/deploy/counter.so");
-    // If the program doesn't exist, use a minimal dummy program
     std::fs::read(so_path).unwrap_or_else(|_| {
-        // Minimal BPF program bytes (just enough to pass validation)
-        vec![
-            0x7f, 0x45, 0x4c, 0x46, // ELF magic
-            0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ]
+        include_bytes!("../../loader/tests/programs_bytes/hello_world.so").to_vec()
     })
+}
+
+fn new_v3_deploy_svm() -> LiteSVM {
+    LiteSVM::default()
+        .with_feature_set(FeatureSet::all_enabled())
+        .with_builtins()
+        .with_lamports(1_000_000u64.wrapping_mul(LAMPORTS_PER_SOL))
+        .with_sysvars()
+}
+
+fn deploy_upgradeable_program(svm: &mut LiteSVM, payer: &Keypair, program_bytes: &[u8]) -> Address {
+    const CHUNK_SIZE: usize = 512;
+
+    let buffer = Keypair::new();
+    let program = Keypair::new();
+    let payer_address = payer.pubkey();
+
+    let buffer_len = UpgradeableLoaderState::size_of_buffer(program_bytes.len());
+    let buffer_lamports = svm.minimum_balance_for_rent_exemption(buffer_len);
+    let create_buffer_tx = Transaction::new_signed_with_payer(
+        &loader_v3_instruction::create_buffer(
+            &payer_address,
+            &buffer.pubkey(),
+            &payer_address,
+            buffer_lamports,
+            program_bytes.len(),
+        )
+        .unwrap(),
+        Some(&payer_address),
+        &[payer, &buffer],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(create_buffer_tx).unwrap();
+
+    for (chunk_idx, chunk) in program_bytes.chunks(CHUNK_SIZE).enumerate() {
+        let write_tx = Transaction::new_signed_with_payer(
+            &[loader_v3_instruction::write(
+                &buffer.pubkey(),
+                &payer_address,
+                (chunk_idx * CHUNK_SIZE) as u32,
+                chunk.to_vec(),
+            )],
+            Some(&payer_address),
+            &[payer],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(write_tx).unwrap();
+    }
+
+    let program_account_rent =
+        svm.minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program());
+    let programdata_rent = svm.minimum_balance_for_rent_exemption(
+        UpgradeableLoaderState::size_of_programdata(program_bytes.len() * 2),
+    );
+    #[allow(deprecated)]
+    let deploy_tx = Transaction::new_signed_with_payer(
+        &loader_v3_instruction::deploy_with_max_program_len(
+            &payer_address,
+            &program.pubkey(),
+            &buffer.pubkey(),
+            &payer_address,
+            program_account_rent + programdata_rent,
+            program_bytes.len() * 2,
+        )
+        .unwrap(),
+        Some(&payer_address),
+        &[payer, &program],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(deploy_tx).unwrap();
+
+    program.pubkey()
 }
 
 /// This test demonstrates the explicit load_existing_programs() method works correctly
 #[test]
 fn test_explicit_load_existing_programs() {
-    let mut svm = LiteSVM::new();
+    let mut svm = LiteSVM::default()
+        .with_feature_set(FeatureSet::all_enabled())
+        .with_builtins()
+        .with_lamports(1_000_000u64.wrapping_mul(LAMPORTS_PER_SOL))
+        .with_sysvars();
 
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
 
-    // Add a program using the standard method
-    let program_id = Pubkey::new_unique();
+    let program_id = Address::new_unique();
+    let programdata_id = Address::new_unique();
     let program_bytes = read_counter_program();
 
-    svm.add_program(program_id, &program_bytes).unwrap();
+    let program_state = UpgradeableLoaderState::Program {
+        programdata_address: programdata_id,
+    };
+    let program_data = bincode::serialize(&program_state).unwrap();
+    let mut program_account =
+        solana_account::Account::new(1_000_000, program_data.len(), &bpf_loader_upgradeable::id());
+    program_account.data = program_data;
+    program_account.executable = true;
 
-    // Get the program account
-    let program_account = svm.get_account(&program_id).unwrap();
-    assert!(program_account.executable);
+    let programdata_state = UpgradeableLoaderState::ProgramData {
+        slot: 0,
+        upgrade_authority_address: Some(payer.pubkey()),
+    };
+    let mut programdata_data = bincode::serialize(&programdata_state).unwrap();
+    programdata_data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
+    programdata_data.extend_from_slice(&program_bytes);
+    let mut programdata_account = solana_account::Account::new(
+        10_000_000,
+        programdata_data.len(),
+        &bpf_loader_upgradeable::id(),
+    );
+    programdata_account.data = programdata_data;
 
-    // Create a new SVM instance and manually add the program account
-    let mut svm2 = LiteSVM::new();
-    svm2.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
-
-    // Simulate restoring from saved state - we have the account but not the cache
-    svm2.set_account(program_id, program_account.into())
+    svm.set_account(programdata_id, programdata_account)
         .unwrap();
+    svm.set_account(program_id, program_account).unwrap();
 
-    // Explicitly load all existing programs
-    svm2.load_existing_programs().unwrap();
+    svm.load_existing_programs().unwrap();
 
-    // Verify the program is now in the cache by checking it can be called
-    // (Even if it fails execution, it should not fail with "program not found")
-    let counter_address = Pubkey::new_unique();
-    svm2.set_account(
+    let counter_address = Address::new_unique();
+    svm.set_account(
         counter_address,
         solana_account::Account {
             lamports: 5,
             data: vec![0_u8; std::mem::size_of::<u32>()],
             owner: program_id,
             ..Default::default()
-        }
-        .into(),
+        },
     )
     .unwrap();
 
@@ -78,12 +167,11 @@ fn test_explicit_load_existing_programs() {
         &[instruction],
         Some(&payer.pubkey()),
         &[&payer],
-        svm2.latest_blockhash(),
+        svm.latest_blockhash(),
     );
 
-    let result = svm2.send_transaction(tx);
+    let result = svm.send_transaction(tx);
 
-    // Should not fail with "program not found"
     if let Err(e) = &result {
         let err_string = format!("{:?}", e);
         assert!(
@@ -91,63 +179,29 @@ fn test_explicit_load_existing_programs() {
             "Program should be loaded via load_existing_programs(), but got: {:?}",
             e
         );
+        assert!(
+            !err_string.contains("InvalidProgramForExecution"),
+            "Program should be executable after load_existing_programs(), but got: {:?}",
+            e
+        );
     }
 }
 
-/// Test that programs with the upgradeable loader are auto-loaded when synced
+/// Test that BPF loader accounts are synced even when not in the writable set.
 #[test]
-fn test_bpf_upgradeable_program_auto_load_on_sync() {
-    let mut svm = LiteSVM::new();
+fn test_bpf_loader_accounts_synced() {
+    let mut svm = new_v3_deploy_svm();
 
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
-    let program_id = Pubkey::new_unique();
-    let programdata_id = Pubkey::new_unique();
-    let program_bytes = read_counter_program();
+    let program_id = deploy_upgradeable_program(&mut svm, &payer, &read_counter_program());
 
-    // Create a Program account (would normally be created during deployment)
-    let program_state = UpgradeableLoaderState::Program {
-        programdata_address: programdata_id,
-    };
-    let program_data = bincode::serialize(&program_state).unwrap();
-    let mut program_account =
-        AccountSharedData::new(1_000_000, program_data.len(), &bpf_loader_upgradeable::id());
-    program_account.set_data_from_slice(&program_data);
-    // Note: executable flag will be set by sync_accounts
+    let stored = svm.get_account(&program_id).unwrap();
+    assert!(stored.executable);
+    assert_eq!(stored.owner, bpf_loader_upgradeable::id());
 
-    // Create ProgramData account
-    let programdata_state = UpgradeableLoaderState::ProgramData {
-        slot: 0,
-        upgrade_authority_address: Some(payer.pubkey()),
-    };
-    let programdata_metadata = bincode::serialize(&programdata_state).unwrap();
-    let mut programdata_account = AccountSharedData::new(
-        10_000_000,
-        UpgradeableLoaderState::size_of_programdata_metadata() + program_bytes.len(),
-        &bpf_loader_upgradeable::id(),
-    );
-    let mut data = programdata_metadata.clone();
-    data.extend_from_slice(&program_bytes);
-    programdata_account.set_data_from_slice(&data);
-
-    // Add accounts to SVM
-    svm.set_account(program_id, program_account.into()).unwrap();
-    svm.set_account(programdata_id, programdata_account.into())
-        .unwrap();
-
-    // Load existing programs (this should auto-load the upgradeable program)
-    svm.load_existing_programs().unwrap();
-
-    // Verify program account is now marked executable
-    let program_account_after = svm.get_account(&program_id).unwrap();
-    assert!(
-        program_account_after.executable,
-        "Program account should be marked executable after sync"
-    );
-
-    // Verify we can reference the program in a transaction
-    let counter_address = Pubkey::new_unique();
+    let counter_address = Address::new_unique();
     svm.set_account(
         counter_address,
         solana_account::Account {
@@ -175,17 +229,16 @@ fn test_bpf_upgradeable_program_auto_load_on_sync() {
 
     let result = svm.send_transaction(tx);
 
-    // Should not fail with "program not found" or "not executable"
     if let Err(e) = &result {
         let err_string = format!("{:?}", e);
         assert!(
             !err_string.contains("AccountNotFound"),
-            "Program should be auto-loaded, but got: {:?}",
+            "Program should be synced after deploy, but got: {:?}",
             e
         );
         assert!(
             !err_string.contains("InvalidProgramForExecution"),
-            "Program should be executable, but got: {:?}",
+            "Program should be synced and executable after deploy, but got: {:?}",
             e
         );
     }
