@@ -234,11 +234,6 @@ impl AccountsDb {
 
             self.add_account(pubkey, acc)?;
         }
-
-        // After syncing accounts, check for any executable program accounts that weren't explicitly loaded
-        // This handles the case where deployment creates program+programdata, but only programdata is in ExecutionRecord
-        self.load_all_existing_programs()?;
-
         Ok(())
     }
 

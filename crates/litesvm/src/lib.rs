@@ -306,7 +306,6 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state, RentState},
         },
     },
-    itertools::Itertools,
     agave_feature_set::{
         increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
     },
@@ -314,6 +313,7 @@ use {
     agave_syscalls::{
         create_program_runtime_environment_v1, create_program_runtime_environment_v2,
     },
+    itertools::Itertools,
     log::error,
     serde::de::DeserializeOwned,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
