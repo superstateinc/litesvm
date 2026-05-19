@@ -213,6 +213,22 @@ impl AccountsDb {
         self.inner.insert(address, data);
     }
 
+    /// Rebuilds the sysvar cache from account data already present in `self.inner`.
+    #[cfg(feature = "persistence-internal")]
+    pub(crate) fn rebuild_sysvar_cache(&mut self) {
+        self.sysvar_cache.reset();
+        let accounts = &self.inner;
+        self.sysvar_cache
+            .fill_missing_entries(|pubkey, set_sysvar| {
+                if let Some(acc) = accounts.get(pubkey) {
+                    set_sysvar(acc.data())
+                }
+            });
+        if let Ok(clock) = self.sysvar_cache.get_clock() {
+            self.programs_cache.set_slot_for_tests(clock.slot);
+        }
+    }
+
     pub(crate) fn sync_accounts(
         &mut self,
         mut accounts: Vec<(Address, AccountSharedData)>,
@@ -278,7 +294,7 @@ impl AccountsDb {
 
         let owner = program_account.owner();
         let program_runtime_v1 = self.environments.program_runtime_v1.clone();
-        let slot = self.sysvar_cache.get_clock().unwrap().slot;
+        let slot = self.sysvar_cache.get_clock().map(|c| c.slot).unwrap_or(0);
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {
             ProgramCacheEntry::new(
